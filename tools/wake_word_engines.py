@@ -187,6 +187,14 @@ class _SherpaKwsEngine(_Engine):
         if not (d / "tokens.txt").exists():
             raise RuntimeError(f"sherpa KWS model not found at {d}")
 
+        def _derive(p: str, **kw):
+            # ``text2token`` returns one token list per input phrase, but a phrase it cannot cover
+            # at all comes back as a SHORTER list (usually empty) — it drops the whole phrase
+            # rather than skipping the unknown part. Index defensively so the guard below can name
+            # the phrase instead of dying on an opaque IndexError.
+            derived = text2token([p], tokens=str(d / "tokens.txt"), **kw)
+            return derived[0] if derived else []
+
         # Phrase set: this profile's phrase plus — with profile routing on — every other
         # wake-enabled profile's phrase, so ONE listener can wake any profile.
         phrase = str(ww._get(cfg, "phrase") or "hey hermes").strip()
@@ -202,24 +210,35 @@ class _SherpaKwsEngine(_Engine):
         readings = sub.get("phrase_readings")
         readings = ({str(k).strip(): " ".join(str(v).split()).split()
                      for k, v in readings.items()} if isinstance(readings, dict) else {})
+        # A reading keyed to a phrase that is not in the set above is a typo that would otherwise
+        # be silently ignored (the loop below only looks up phrases it knows about) — the spotter
+        # would then derive the standard reading and quietly not hear the phrase.
+        known = {p.strip() for p in phrases}
+        stray = sorted(k for k in readings if k not in known)
+        if stray:
+            raise RuntimeError(f"sherpa KWS: phrase_readings key(s) {stray!r} match no configured "
+                               f"phrase {sorted(known)!r}")
         tokens = []
         for p in phrases:
             reading = readings.get(p.strip())
             if reading:
                 tokens.append(reading)
             # Tokenisation is model-family specific: the English GigaSpeech KWS models ship a
-            # SentencePiece ``bpe.model`` (and need upper-cased text), while the zh-en / Chinese
-            # models have none and tokenise hanzi into pinyin instead.
+            # SentencePiece ``bpe.model`` (whose vocabulary is upper-cased, so the phrase is
+            # upper-cased too), while the zh-en / Chinese models have none and tokenise hanzi
+            # into pinyin instead — pinyin tokens are already lower-case and per-syllable, so the
+            # phrase goes in verbatim.
             elif (d / "bpe.model").exists():
-                tokens.append(text2token([p.upper()], tokens=str(d / "tokens.txt"),
-                                         tokens_type="bpe", bpe_model=str(d / "bpe.model"))[0])
+                tokens.append(_derive(p.upper(), tokens_type="bpe", bpe_model=str(d / "bpe.model")))
             else:
-                tokens.append(text2token([p.upper()], tokens=str(d / "tokens.txt"),
-                                         tokens_type="ppinyin")[0])
+                tokens.append(_derive(p, tokens_type="ppinyin"))
         missing = [p for p, toks in zip(phrases, tokens) if not toks]
         if missing:
             raise RuntimeError("sherpa KWS: no tokens produced for phrase(s) "
-                               f"{missing!r} against {d.name} — check tokens.txt/model mismatch")
+                               f"{missing!r} against {d.name} — the phrase is not representable in "
+                               "this model's vocabulary (English models tokenise English words, "
+                               "zh-en/Chinese ones tokenise hanzi into pinyin); check "
+                               "tokens.txt/model mismatch")
         if readings:
             unknown = sorted({t for p, toks in zip(phrases, tokens) if p.strip() in readings
                               for t in toks} - _sherpa_token_table(d))
