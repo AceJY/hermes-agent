@@ -164,9 +164,16 @@ def _ensure_sherpa_model(root: Optional[Path] = None) -> Path:
     return target
 
 
+def _sherpa_token_table(d: Path) -> set[str]:
+    """The model's vocabulary (first column of ``tokens.txt``) — used to validate explicit readings."""
+    lines = (d / "tokens.txt").read_text(encoding="utf-8").splitlines()
+    return {parts[0] for parts in (line.split() for line in lines) if parts}
+
+
 class _SherpaKwsEngine(_Engine):
     """sherpa-onnx open-vocabulary keyword spotting — any typed phrase, zero training. ``wake_word.phrase``
-    is BPE-tokenized at runtime against the model's vocabulary: DETECTION config, not a cosmetic label."""
+    is tokenized at runtime against the model's vocabulary (BPE for the English models, pinyin for the
+    Chinese/zh-en ones, or an explicit ``phrase_readings`` entry): DETECTION config, not a cosmetic label."""
 
     feature, section = "wake.sherpa", "sherpa"
     frame_length = 1280  # streaming zipformer accepts any chunk; match capture path.
@@ -188,8 +195,37 @@ class _SherpaKwsEngine(_Engine):
             for prof, p in ww.enrolled_profile_phrases().items():
                 phrase_map.setdefault(p.strip(), prof)
         phrases = list(phrase_map)
-        tokens = text2token([p.upper() for p in phrases], tokens=str(d / "tokens.txt"), tokens_type="bpe",
-                            bpe_model=str(d / "bpe.model"))
+        # ``phrase_readings``: explicit pronunciation for a phrase, as space-separated pinyin
+        # (e.g. {嗨天枢: "h ēi t iān sh ū"}). Needed because standard pinyin is not always how a
+        # phrase is actually SPOKEN — 「嗨」 is hāi in dictionaries but commonly said hēi, and the
+        # acoustic model matches the spoken reading, not the dictionary one. Absent → derive.
+        readings = sub.get("phrase_readings")
+        readings = ({str(k).strip(): " ".join(str(v).split()).split()
+                     for k, v in readings.items()} if isinstance(readings, dict) else {})
+        tokens = []
+        for p in phrases:
+            reading = readings.get(p.strip())
+            if reading:
+                tokens.append(reading)
+            # Tokenisation is model-family specific: the English GigaSpeech KWS models ship a
+            # SentencePiece ``bpe.model`` (and need upper-cased text), while the zh-en / Chinese
+            # models have none and tokenise hanzi into pinyin instead.
+            elif (d / "bpe.model").exists():
+                tokens.append(text2token([p.upper()], tokens=str(d / "tokens.txt"),
+                                         tokens_type="bpe", bpe_model=str(d / "bpe.model"))[0])
+            else:
+                tokens.append(text2token([p.upper()], tokens=str(d / "tokens.txt"),
+                                         tokens_type="ppinyin")[0])
+        missing = [p for p, toks in zip(phrases, tokens) if not toks]
+        if missing:
+            raise RuntimeError("sherpa KWS: no tokens produced for phrase(s) "
+                               f"{missing!r} against {d.name} — check tokens.txt/model mismatch")
+        if readings:
+            unknown = sorted({t for p, toks in zip(phrases, tokens) if p.strip() in readings
+                              for t in toks} - _sherpa_token_table(d))
+            if unknown:
+                raise RuntimeError(f"sherpa KWS: phrase_readings tokens not in {d.name}/tokens.txt: "
+                                   f"{unknown}")
         # sherpa keyword entries reject spaces in the @display-name; underscore them and
         # map display → profile for match routing.
         self._display_to_profile: Dict[str, str] = {}
